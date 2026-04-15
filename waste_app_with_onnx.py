@@ -474,16 +474,18 @@
 
 
 # camera_loop()
-
-
 """
 Real-Time Waste Classification — Streamlit App
-Uses streamlit-webrtc so the app works with any browser camera
-(laptop webcam, phone camera, etc.) instead of a local cv2 device.
+Two decoupled background threads:
+  Thread 1 (capture)   — reads camera frames at full speed, encodes JPEG for display
+  Thread 2 (inference) — runs ONNX on latest frame independently; never blocks capture
+Fragment reads pre-built JPEG + latest probs — zero blocking I/O in UI thread.
 
-Two decoupled background threads are preserved unchanged:
-  Thread 1 (capture)   — driven by WebRTC video frames instead of cv2
-  Thread 2 (inference) — runs ONNX on latest frame independently
+Camera sources supported:
+  - Laptop/desktop webcam  → index 0, 1, 2 …
+  - Android phone (DroidCam app) → http://<phone-ip>:4747/video
+  - iPhone (EpocCam / Camo)     → http://<phone-ip>:8080/video
+  - Any RTSP/HTTP stream         → paste URL directly
 """
 
 import time
@@ -491,12 +493,10 @@ import threading
 import collections
 from pathlib import Path
 
-import av
 import cv2
 import numpy as np
 import streamlit as st
 import onnxruntime as ort
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
 
 
 # ─────────────────────────── Softmax ────────────────────────────────
@@ -616,93 +616,105 @@ class TemporalSmoother:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  WebRTC Video Processor
-#
-#  Replaces CameraThread. streamlit-webrtc calls recv() for every
-#  frame delivered by the browser (laptop cam, phone cam, etc.).
-#
-#  _inference_loop runs as a background daemon thread — identical
-#  in spirit to the original Thread 2.  recv() (= capture) never
-#  waits for inference, preserving the decoupled design.
+#  CameraThread — identical logic to original.
+#  src accepts int (webcam index) OR str (HTTP/RTSP URL for phone).
 # ═══════════════════════════════════════════════════════════════════
-class WasteVideoProcessor(VideoProcessorBase):
-    def __init__(self):
-        self._session = load_model()
-        self._flip    = True
+class CameraThread:
+    def __init__(self, src=0):
+        self.src      = src
+        self.ok       = False
+        self.active   = False
+        self._flip    = False
+        self._session = None
 
-        # shared: recv → inference
         self._raw_frame  = None
         self._frame_lock = threading.Lock()
 
-        # shared: inference → recv / stats
+        self._jpeg     = None
         self._probs    = None
         self._latency  = 0.0
         self._out_lock = threading.Lock()
 
-        # stats exposed to the Streamlit fragment
-        self.frame_cnt = 0
-        self.latencies = collections.deque(maxlen=60)
+        self._cap_thread = None
+        self._inf_thread = None
 
+    def start(self, session, flip: bool):
+        if self._cap_thread and self._cap_thread.is_alive():
+            return
+        self._session = session
+        self._flip    = flip
+        self.active   = True
+        self._cap_thread = threading.Thread(target=self._capture_loop,   daemon=True)
         self._inf_thread = threading.Thread(target=self._inference_loop, daemon=True)
+        self._cap_thread.start()
         self._inf_thread.start()
+
+    def stop(self):
+        self.active = False
 
     def set_flip(self, flip: bool):
         self._flip = flip
 
-    # ── Called by streamlit-webrtc for every incoming frame ──────────
-    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        img_bgr = frame.to_ndarray(format="bgr24")
-
-        if self._flip:
-            img_bgr = cv2.flip(img_bgr, 1)
-
-        # Share with inference thread (non-blocking)
-        with self._frame_lock:
-            self._raw_frame = img_bgr
-
-        # Read latest probs without waiting for inference
+    def read(self):
         with self._out_lock:
+            jpeg    = self._jpeg
             probs   = self._probs.copy() if self._probs is not None else None
             latency = self._latency
+        return jpeg, probs, latency
 
-        self.frame_cnt += 1
-        if probs is not None:
-            self.latencies.append(latency)
+    def _capture_loop(self):
+        src = self.src if isinstance(self.src, str) else int(self.src)
+        cap = cv2.VideoCapture(src)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.ok = cap.isOpened()
 
-        # Draw overlay
-        display = img_bgr.copy()
-        h, w    = display.shape[:2]
-        overlay = display.copy()
-        cv2.rectangle(overlay, (0, h - 90), (w, h), (13, 17, 23), -1)
-        cv2.addWeighted(overlay, 0.8, display, 0.2, 0, display)
+        while self.active:
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                time.sleep(0.005)
+                continue
 
-        if probs is not None:
-            cls_idx  = int(np.argmax(probs))
-            cls_name = CLASS_NAMES[cls_idx]
-            cfg = CLASS_CONFIG.get(cls_name, {"color": "#ffffff"})
-            hx  = cfg["color"].lstrip("#")
-            bgr = (int(hx[4:6], 16), int(hx[2:4], 16), int(hx[0:2], 16))
-            cv2.putText(display, cls_name,
-                        (16, h - 52), cv2.FONT_HERSHEY_DUPLEX, 1.1, bgr, 2, cv2.LINE_AA)
-            cv2.putText(display, f"Conf: {float(probs[cls_idx]):.0%}",
-                        (16, h - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (139, 148, 158), 1, cv2.LINE_AA)
-        else:
-            cv2.putText(display, "Scanning...",
-                        (16, h - 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (139, 148, 158), 2, cv2.LINE_AA)
+            if self._flip:
+                frame = cv2.flip(frame, 1)
 
-        return av.VideoFrame.from_ndarray(display, format="bgr24")
+            with self._frame_lock:
+                self._raw_frame = frame
 
-    def read_stats(self):
-        """Returns (probs | None, latency_ms) — called from the fragment."""
+            with self._out_lock:
+                probs = self._probs.copy() if self._probs is not None else None
+
+            display = frame.copy()
+            h, w    = display.shape[:2]
+            overlay = display.copy()
+            cv2.rectangle(overlay, (0, h - 90), (w, h), (13, 17, 23), -1)
+            cv2.addWeighted(overlay, 0.8, display, 0.2, 0, display)
+
+            if probs is not None:
+                cls_idx  = int(np.argmax(probs))
+                cls_name = CLASS_NAMES[cls_idx]
+                cfg = CLASS_CONFIG.get(cls_name, {"color": "#ffffff"})
+                hx  = cfg["color"].lstrip("#")
+                bgr = (int(hx[4:6], 16), int(hx[2:4], 16), int(hx[0:2], 16))
+                cv2.putText(display, cls_name,
+                            (16, h - 52), cv2.FONT_HERSHEY_DUPLEX, 1.1, bgr, 2, cv2.LINE_AA)
+                cv2.putText(display, f"Conf: {float(probs[cls_idx]):.0%}",
+                            (16, h - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (139, 148, 158), 1, cv2.LINE_AA)
+            else:
+                cv2.putText(display, "Scanning...",
+                            (16, h - 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (139, 148, 158), 2, cv2.LINE_AA)
+
+            _, buf = cv2.imencode(".jpg", display, [cv2.IMWRITE_JPEG_QUALITY, 82])
+            with self._out_lock:
+                self._jpeg = buf.tobytes()
+
+        cap.release()
+        self.ok = False
         with self._out_lock:
-            probs   = self._probs.copy() if self._probs is not None else None
-            latency = self._latency
-        return probs, latency
+            self._jpeg = None
 
-    # ── Thread 2: inference at its own pace (unchanged logic) ────────
     def _inference_loop(self):
         last_frame = None
-        while True:
+        while self.active:
             with self._frame_lock:
                 frame = self._raw_frame
 
@@ -725,14 +737,17 @@ class WasteVideoProcessor(VideoProcessorBase):
 
 # ─────────────────────────── Session State ──────────────────────────
 for k, v in {
+    "running":        False,
     "frame_cnt":      0,
-    "t_start":        time.time(),
+    "t_start":        None,
     "latencies":      collections.deque(maxlen=60),
-    "smoother":       TemporalSmoother(10, 0.45),
+    "smoother":       None,
     "cfg_flip":       True,
     "cfg_show_all":   True,
     "cfg_smooth_win": 10,
     "cfg_conf_thr":   0.45,
+    "cam_instance":   None,
+    "cam_src_last":   None,
 }.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -742,6 +757,39 @@ for k, v in {
 with st.sidebar:
     st.markdown("## ♻️ WasteVision AI")
     st.markdown("Real-time waste classification using ONNX EfficientNet-B3")
+    st.divider()
+
+    # ── Camera source ────────────────────────────────────────────────
+    st.markdown("### 📷 Camera Source")
+    cam_mode = st.radio(
+        "cam_mode",
+        ["💻 Laptop webcam", "📱 Phone (IP stream)", "🔢 Custom index"],
+        label_visibility="collapsed",
+    )
+
+    if cam_mode == "💻 Laptop webcam":
+        cam_src = st.selectbox("Webcam index (0 = default, try 1/2 if wrong)", [0, 1, 2, 3])
+        st.caption("Index 0 is your default webcam.")
+
+    elif cam_mode == "📱 Phone (IP stream)":
+        st.markdown("""
+**Steps:**
+1. Install a streaming app on your phone:
+   - **Android** → [DroidCam](https://play.google.com/store/apps/details?id=com.dev47apps.droidcam)
+   - **iPhone** → [EpocCam](https://apps.apple.com/app/epoccam-webcam-for-mac-and-pc/id449133483)
+2. Connect phone & laptop to **same Wi-Fi**
+3. Open app → note the IP shown
+4. Paste URL below ↓
+""")
+        cam_src = st.text_input(
+            "Stream URL",
+            value="http://192.168.1.100:4747/video",
+            help="DroidCam: http://<ip>:4747/video | EpocCam: http://<ip>:8080/video",
+        ).strip()
+
+    else:
+        cam_src = int(st.number_input("Device index", min_value=0, max_value=10, value=0, step=1))
+
     st.divider()
     st.markdown("### ⚙️ Settings")
     smooth_window    = st.slider("Smoothing window (frames)", 1, 30, 10)
@@ -758,45 +806,63 @@ with st.sidebar:
             unsafe_allow_html=True,
         )
 
-st.session_state.cfg_flip     = flip_camera
-st.session_state.cfg_show_all = show_all_classes
-if st.session_state.smoother.threshold != conf_threshold or \
-   st.session_state.smoother.buffer.maxlen != smooth_window:
-    st.session_state.smoother = TemporalSmoother(smooth_window, conf_threshold)
+if st.session_state.running and st.session_state.cam_instance:
+    st.session_state.cam_instance.set_flip(flip_camera)
 
 
 # ─────────────────────────── Header ─────────────────────────────────
 st.markdown("# ♻️ WasteVision AI — Real-Time Classification")
-st.markdown("Allow camera access in your browser — works on laptop and phone cameras.")
+st.markdown("Point your camera at any waste item for instant AI-powered sorting guidance.")
+st.divider()
+
+col_start, col_stop, _ = st.columns([1, 1, 3])
+with col_start:
+    if st.button("▶ Start Camera", type="primary", use_container_width=True):
+        session = load_model()
+
+        # Create new CameraThread if source changed or first run
+        if st.session_state.cam_src_last != cam_src or st.session_state.cam_instance is None:
+            if st.session_state.cam_instance is not None:
+                st.session_state.cam_instance.stop()
+                time.sleep(0.2)
+            cam = CameraThread(src=cam_src)
+            st.session_state.cam_instance = cam
+            st.session_state.cam_src_last = cam_src
+        else:
+            cam = st.session_state.cam_instance
+
+        cam.start(session, flip=flip_camera)
+        for _ in range(30):
+            if cam.ok:
+                break
+            time.sleep(0.1)
+
+        if not cam.ok:
+            st.error(
+                "❌ Could not open camera.\n\n"
+                "**Laptop:** try index 1 or 2 in the sidebar.\n\n"
+                "**Phone:** make sure the app is running, URL is correct, "
+                "and both devices are on the same Wi-Fi network."
+            )
+        else:
+            st.session_state.running        = True
+            st.session_state.frame_cnt      = 0
+            st.session_state.t_start        = time.time()
+            st.session_state.latencies      = collections.deque(maxlen=60)
+            st.session_state.smoother       = TemporalSmoother(smooth_window, conf_threshold)
+
+with col_stop:
+    if st.button("⏹ Stop", use_container_width=True):
+        if st.session_state.cam_instance:
+            st.session_state.cam_instance.stop()
+        st.session_state.running = False
+
 st.divider()
 
 # ── Stable layout placeholders ───────────────────────────────────────
 col_cam, col_info = st.columns([3, 2], gap="large")
-
 with col_cam:
-    # ── WebRTC streamer (replaces Start/Stop buttons + CameraThread) ──
-    # media_stream_constraints lets the browser pick the best available camera.
-    # On phones, set facingMode: "environment" to default to the rear camera.
-    ctx = webrtc_streamer(
-        key="waste-vision",
-        mode=WebRtcMode.SENDRECV,
-        video_processor_factory=WasteVideoProcessor,
-        media_stream_constraints={
-            "video": {
-                "width":  {"ideal": 1280},
-                "height": {"ideal": 720},
-                # Use rear camera on mobile; falls back to front cam on laptops
-                "facingMode": {"ideal": "environment"},
-            },
-            "audio": False,
-        },
-        async_processing=True,
-    )
-
-    # Keep flip setting in sync with sidebar toggle
-    if ctx.video_processor:
-        ctx.video_processor.set_flip(flip_camera)
-
+    cam_ph = st.empty()
 with col_info:
     pred_ph      = st.empty()
     metrics_ph   = st.empty()
@@ -804,25 +870,41 @@ with col_info:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  FRAGMENT — fires every 66 ms
-#  Reads latest probs + stats from the processor. No I/O. No inference.
+#  FRAGMENT — fires every 66 ms  (identical to original)
 # ═══════════════════════════════════════════════════════════════════
 @st.fragment(run_every=0.066)
-def stats_loop():
-    smoother = st.session_state.smoother
-    show_all = st.session_state.cfg_show_all
-
-    if not ctx.state.playing or ctx.video_processor is None:
+def camera_loop():
+    if not st.session_state.running:
+        cam_ph.markdown("""
+        <div style="background:#161b22;border:2px dashed #30363d;border-radius:16px;
+                    height:420px;display:flex;align-items:center;justify-content:center;
+                    flex-direction:column;gap:16px">
+            <div style="font-size:4rem">📷</div>
+            <div style="font-size:1.2rem;color:#8b949e">Click ▶ Start Camera to begin</div>
+            <div style="font-size:0.85rem;color:#484f58">ONNX EfficientNet-B3 · Real-Time · 6 Classes</div>
+        </div>""", unsafe_allow_html=True)
         pred_ph.markdown("""
         <div class="pred-card">
             <div style="font-size:2.5rem">♻️</div>
             <div class="pred-class" style="color:#8b949e">Ready</div>
-            <div class="pred-conf">Click START above to begin</div>
+            <div class="pred-conf">Awaiting camera feed</div>
         </div>""", unsafe_allow_html=True)
         return
 
-    raw_probs, latency = ctx.video_processor.read_stats()
-    frame_cnt          = ctx.video_processor.frame_cnt
+    smoother = st.session_state.smoother
+    show_all = st.session_state.cfg_show_all
+    if smoother is None:
+        return
+
+    cam = st.session_state.cam_instance
+    if cam is None:
+        return
+
+    jpeg, raw_probs, latency = cam.read()
+
+    if jpeg is None:
+        cam_ph.warning("⏳ Waiting for first camera frame…")
+        return
 
     if raw_probs is not None:
         st.session_state.latencies.append(latency)
@@ -830,8 +912,12 @@ def stats_loop():
 
     smooth_class, smooth_conf, smooth_probs = smoother.get_smoothed()
 
-    elapsed = time.time() - st.session_state.t_start
-    fps     = frame_cnt / max(elapsed, 1e-6)
+    st.session_state.frame_cnt += 1
+    elapsed = time.time() - (st.session_state.t_start or time.time())
+    fps     = st.session_state.frame_cnt / max(elapsed, 1e-6)
+
+    frame_np = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
+    cam_ph.image(cv2.cvtColor(frame_np, cv2.COLOR_BGR2RGB), use_container_width=True)
 
     # ── Prediction card ───────────────────────────────────────────────
     if smooth_class and smooth_class != "Uncertain":
@@ -870,7 +956,7 @@ def stats_loop():
             <div class="metric-lbl">Latency</div>
         </div>
         <div class="metric-box">
-            <div class="metric-val" style="color:#e3b341">{frame_cnt}</div>
+            <div class="metric-val" style="color:#e3b341">{st.session_state.frame_cnt}</div>
             <div class="metric-lbl">Frames</div>
         </div>
     </div>""", unsafe_allow_html=True)
@@ -900,4 +986,4 @@ def stats_loop():
         )
 
 
-stats_loop()
+camera_loop()
