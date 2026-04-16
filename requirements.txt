@@ -5,3 +5,4 @@ onnxruntime>=1.16.0
 Pillow>=9.0.0
 av
 streamlit-webrtc
+torch
